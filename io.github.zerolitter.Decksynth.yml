@@ -1,0 +1,118 @@
+app-id: io.github.zerolitter.Decksynth
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+
+# Electron prebuilt runtime + zypak sandbox bridge (standard for Electron apps)
+base: org.electronjs.Electron2.BaseApp
+base-version: '26.08'
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.node24  
+
+command: decksynth
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio            # audio out (PipeWire's pulse server); Flatpak also exposes /dev/snd with it,
+                                   # which is all the raw ALSA MIDI input (/dev/snd/midiC*D*) needs
+  - --device=dri                   # GPU for the Electron UI
+  - --device=input                 # game controllers (SDL): the Deck's buttons and pads
+  - --require-version=1.16.0       
+  - --env=ELECTRON_OZONE_PLATFORM_HINT=auto
+  # No --share=network: app is local hosted (stdin/stdout bridge, no server)
+  # No --filesystem=home: sample import goes through file dialogs/portals;
+  # add --filesystem=xdg-music:ro only if browsing proves not workable
+
+build-options:
+  append-path: /usr/lib/sdk/node24/bin
+  env:
+    npm_config_nodedir: /usr/lib/sdk/node24
+    ELECTRON_SKIP_BINARY_DOWNLOAD: '1'      # electron zip is verified below
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'   # dev-only
+
+modules:
+  # SDL2 audio library the Python engine dlopens (libSDL2-2.0.so.0)
+  - name: SDL2
+    buildsystem: cmake-ninja
+    builddir: true       # SDL refuses 
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DSDL_STATIC=OFF
+      - -DSDL_TEST=OFF
+    sources:
+      - type: archive
+        url: https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+        sha256: 5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165
+
+  - name: decksynth
+    buildsystem: simple
+    build-commands:
+      # 1) Build Electron/React UI locally from the lockfile-pinned cache
+      - cd ui && npm ci --offline --ignore-scripts --audit=false --fund=false
+        --cache="$FLATPAK_BUILDER_BUILDDIR/flatpak-node/npm-cache"
+      - cd ui && npm run build  # tsc --noEmit && vite build
+
+      # 1b) Native kernels, like the release download: the FX library (decksynth/native/libdsfx.so) and the
+      #     cached kernels for pitch shift, vocoder, gate and the fast voices (filter, spectral, drums, sampler)
+      #     To decksynth/native/prebuilt; the launcher copies them where the engine looks
+      - tools/build-native.sh decksynth/native/prebuilt
+
+      # 2) Install app tree (engine + built UI + bundled Luna demo kits)
+      - install -d /app/share/decksynth/ui/node_modules/electron/dist
+      - cp -a decksynth /app/share/decksynth/
+      - cp -a ui/dist ui/electron ui/demo-kits ui/package.json
+        /app/share/decksynth/ui/
+      - install -Dm644 ui/src/preview-state.json /app/share/decksynth/ui/src/preview-state.json
+
+      # 3) Electron from the official release (matches lockfile pin 39.8.10)
+      - cp -a "$FLATPAK_BUILDER_BUILDDIR/electron/." /app/share/decksynth/ui/node_modules/electron/dist/
+      - chmod +x /app/share/decksynth/ui/node_modules/electron/dist/electron
+
+      # 4) Upstream launcher, adapted to the sandbox: runtime Python + zypak instead of --no-sandbox
+      - install -Dm755 packaging/flatpak/decksynth /app/bin/decksynth
+      - sed -i 's|^export DECKSYNTH_PYTHON=.*|export DECKSYNTH_PYTHON=/usr/bin/python3|' /app/bin/decksynth
+      - sed -i 's|exec "$APP/ui/node_modules/electron/dist/electron" --no-sandbox|exec
+        zypak-wrapper "$APP/ui/node_modules/electron/dist/electron"|' /app/bin/decksynth
+
+      # 5) Desktop entry, AppStream, icon, license (already reverse-DNS named upstream)
+      - install -Dm644 packaging/flatpak/io.github.zerolitter.Decksynth.desktop
+        /app/share/applications/io.github.zerolitter.Decksynth.desktop
+      - install -Dm644 packaging/flatpak/io.github.zerolitter.Decksynth.metainfo.xml
+        /app/share/metainfo/io.github.zerolitter.Decksynth.metainfo.xml
+      - install -Dm644 packaging/flatpak/io.github.zerolitter.Decksynth.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.zerolitter.Decksynth.svg
+      - install -Dm644 LICENSE /app/share/licenses/io.github.zerolitter.Decksynth/LICENSE
+    sources:
+      - type: git
+        url: https://github.com/Zerolitter/Decksynth.git
+        tag: v0.2.2
+        commit: f1320959ee0122f110aaf4a3837b5c2e65ad86ae   # set with packaging/flatpak/pin-release.sh <tag>
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$
+          
+      # Offline npm cache, generated from ui/package-lock.json 
+      - node-generated-sources.json
+      - type: archive
+        url: https://github.com/electron/electron/releases/download/v39.8.10/electron-v39.8.10-linux-x64.zip
+        sha256: 92e8b031fa5327c78a972279fd75fc8503fcd1773401809f4557e4de583eabd1
+        dest: electron
+        only-arches: [x86_64]
+      - type: archive
+        url: https://github.com/electron/electron/releases/download/v39.8.10/electron-v39.8.10-linux-arm64.zip
+        sha256: 8d01f0063ce2cc83a68b5c723db813c2bb8621ff63ba2ddec786a589baef7247
+        dest: electron
+        only-arches: [aarch64]
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/aclocal
+  - /man
+  - /share/doc
+  - /share/man
+  - '*.a'
+  - '*.la'
